@@ -7,7 +7,7 @@
      1. CONFIG
      ===================================================================== */
   const CFG = {
-    DB: "https://mtp-honey-default-rtdb.firebaseio.com", // default guess from project "mtp-honey"; can be changed inside the app
+    DB: "https://mtp-honey-default-rtdb.asia-southeast1.firebasedatabase.app", // can be changed inside the app
     ROOT: "mtp-honey-v1",
     IDB: "mtp-honey",
     DB_KEY: "mth_db_url",

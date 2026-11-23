@@ -6,7 +6,7 @@
 പഴയ ഫയലുകൾ (index.html, app.js, styles.css, sw.js, manifest.webmanifest, icons/) ഈ ഫയലുകൾ കൊണ്ട് മാറ്റി GitHub/Firebase Hosting-ൽ വീണ്ടും പബ്ലിഷ് ചെയ്യുക. ഫോണിൽ ആപ്പ് ഒരു തവണ പൂർണ്ണമായി അടച്ച് വീണ്ടും തുറക്കുമ്പോൾ പുതിയ പതിപ്പ് വരും.
 
 ## Firebase
-- ഡാറ്റാബേസ് വിലാസം (ഡിഫോൾട്ട്): `https://mtp-honey-default-rtdb.firebaseio.com`
+- ഡാറ്റാബേസ് വിലാസം (ഡിഫോൾട്ട്): `https://mtp-honey-default-rtdb.asia-southeast1.firebasedatabase.app`
 - സ്റ്റാറ്റസ് ബാറിൽ **HTTP 404** കണ്ടാൽ വിലാസം തെറ്റാണ്: ലോഗിൻ സ്ക്രീനിലെ / അഡ്മിനിലെ "Firebase വിലാസം" തുറന്ന് Firebase Console → Realtime Database പേജിലെ വിലാസം നൽകുക. (`mtp-honey.web.app` ഡാറ്റാബേസ് വിലാസമല്ല.)
 - **HTTP 401** = Rules അനുവദിക്കുന്നില്ല (Test mode അല്ലെങ്കിൽ). Test mode 30 ദിവസത്തേക്ക് മാത്രം.
 
