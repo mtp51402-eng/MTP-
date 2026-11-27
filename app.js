@@ -148,11 +148,20 @@
   async function idbGet(k) { const db = await withTimeout(idb(), 2500); return new Promise((res, rej) => { const r = db.transaction("kv", "readonly").objectStore("kv").get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
   async function idbSet(k, v) { const db = await withTimeout(idb(), 2500); return new Promise((res, rej) => { const tx = db.transaction("kv", "readwrite"); tx.objectStore("kv").put(v, k); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); }
 
+  let idbSkip = false;
   async function loadState() {
     const base = defaultState();
-    let saved = null;
-    try { saved = await withTimeout(idbGet("state"), 3000); } catch (e) { /* ignore */ }
-    if (!saved) { try { const raw = localStorage.getItem("mth_state_v1"); if (raw) saved = JSON.parse(raw); } catch (e) { /* ignore */ } }
+    // ഡാറ്റ രണ്ട് സ്ഥലത്ത് (localStorage + IndexedDB) സേവ് ചെയ്യുന്നു; പുതിയ കോപ്പി എടുക്കും
+    let a = { ok: false };
+    for (let i = 0; i < 3 && !a.ok; i++) {
+      try { a = { ok: true, v: await withTimeout(idbGet("state"), 5000) }; } catch (e) { dbPromise = null; await new Promise((r) => setTimeout(r, 400)); }
+    }
+    let b = null;
+    try { const raw = localStorage.getItem("mth_state_v1"); if (raw) b = JSON.parse(raw); } catch (e) { /* ignore */ }
+    const ta = a.ok && a.v && typeof a.v === "object" ? (a.v.savedAt || 1) : 0;
+    const tb = b && typeof b === "object" ? (b.savedAt || 1) : 0;
+    const saved = ta || tb ? (ta >= tb ? a.v : b) : null;
+    if (!a.ok) idbSkip = true; // IndexedDB തകരാറിലാണെങ്കിൽ localStorage മാത്രം ഉപയോഗിക്കും
     if (saved && typeof saved === "object" && saved.data) {
       state = Object.assign(base, saved);
       COLS.forEach((c) => { if (!state.data[c] || typeof state.data[c] !== "object") state.data[c] = base.data[c]; });
@@ -164,8 +173,10 @@
   function persist() { clearTimeout(persistTimer); persistTimer = setTimeout(persistNow, 250); }
   async function persistNow() {
     clearTimeout(persistTimer);
-    try { await withTimeout(idbSet("state", JSON.parse(JSON.stringify(state))), 4000); }
-    catch (e) { try { localStorage.setItem("mth_state_v1", JSON.stringify(state)); } catch (e2) { /* full */ } }
+    state.savedAt = Date.now();
+    try { localStorage.setItem("mth_state_v1", JSON.stringify(state)); } catch (e) { /* full */ }
+    if (idbSkip) return;
+    try { await withTimeout(idbSet("state", JSON.parse(JSON.stringify(state))), 4000); } catch (e) { dbPromise = null; /* localStorage copy remains */ }
   }
 
   /* =====================================================================
