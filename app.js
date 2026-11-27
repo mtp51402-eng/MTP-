@@ -1,5 +1,5 @@
 /* MTP Honey — വാങ്ങൽ, പ്രൊഡക്ഷൻ & വിതരണം
-   Offline-first PWA. Data: IndexedDB (device) ⇄ Firebase Realtime Database (REST). */
+   Offline-first PWA. Data: localStorage + IndexedDB (device). */
 (function () {
   "use strict";
 
@@ -7,7 +7,7 @@
      1. CONFIG
      ===================================================================== */
   const CFG = {
-    DB: "https://mtp-honey-default-rtdb.asia-southeast1.firebasedatabase.app", // can be changed inside the app
+    DB: "",
     ROOT: "mtp-honey-v1",
     IDB: "mtp-honey",
     DB_KEY: "mth_db_url",
@@ -21,7 +21,6 @@
   const BACKUP_COLS = ["products", "suppliers", "shops", "purchases", "sales", "staff"];
   const CATEGORIES = ["തേൻ (Honey)", "മരുന്നുകൾ പൊടിച്ചത് (Herbal Mix)", "ബോട്ടിൽ & ജാർ (Bottles)", "ക്യാഷ് / മറ്റ് ചെലവ് (Cash)", "ട്രാവൽ (Travel)"];
   const UNITS = ["kg", "gram", "bottle", "packet", "litre"];
-
 
   /* =====================================================================
      2. HELPERS
@@ -37,7 +36,6 @@
   const norm = (s) => clean(s).toLowerCase();
   const money = (n) => "₹" + (Number(n) || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 });
   const kgFmt = (n) => (Math.round((Number(n) || 0) * 100) / 100).toLocaleString("en-IN", { maximumFractionDigits: 2 });
-  // Local calendar date (NOT UTC) — fixes wrong "today" in India before 5:30 AM
   const isoOf = (d) => d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
   const todayIso = () => isoOf(new Date());
   const monthNow = () => todayIso().slice(0, 7);
@@ -90,7 +88,6 @@
     return o;
   })();
 
-
   Object.assign(ICON, (() => {
     const mk = (p) => '<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + p + "</svg>";
     return {
@@ -128,7 +125,7 @@
     };
   }
   let state = defaultState();
-  let session = null; // { role:'admin'|'staff', name, code, canProfit }
+  let session = null;
   let ui = { mode: "purchase", pane: "p_entry", pMonth: monthNow(), pSearch: "", sMonth: monthNow(), sSearch: "", rMonth: monthNow(), editPurchase: null, editSale: null };
   let persistTimer = null, dbPromise = null;
 
@@ -151,7 +148,6 @@
   let idbSkip = false;
   async function loadState() {
     const base = defaultState();
-    // ഡാറ്റ രണ്ട് സ്ഥലത്ത് (localStorage + IndexedDB) സേവ് ചെയ്യുന്നു; പുതിയ കോപ്പി എടുക്കും
     let a = { ok: false };
     for (let i = 0; i < 3 && !a.ok; i++) {
       try { a = { ok: true, v: await withTimeout(idbGet("state"), 5000) }; } catch (e) { dbPromise = null; await new Promise((r) => setTimeout(r, 400)); }
@@ -161,7 +157,7 @@
     const ta = a.ok && a.v && typeof a.v === "object" ? (a.v.savedAt || 1) : 0;
     const tb = b && typeof b === "object" ? (b.savedAt || 1) : 0;
     const saved = ta || tb ? (ta >= tb ? a.v : b) : null;
-    if (!a.ok) idbSkip = true; // IndexedDB തകരാറിലാണെങ്കിൽ localStorage മാത്രം ഉപയോഗിക്കും
+    if (!a.ok) idbSkip = true;
     if (saved && typeof saved === "object" && saved.data) {
       state = Object.assign(base, saved);
       COLS.forEach((c) => { if (!state.data[c] || typeof state.data[c] !== "object") state.data[c] = base.data[c]; });
@@ -176,7 +172,7 @@
     state.savedAt = Date.now();
     try { localStorage.setItem("mth_state_v1", JSON.stringify(state)); } catch (e) { /* full */ }
     if (idbSkip) return;
-    try { await withTimeout(idbSet("state", JSON.parse(JSON.stringify(state))), 4000); } catch (e) { dbPromise = null; /* localStorage copy remains */ }
+    try { await withTimeout(idbSet("state", JSON.parse(JSON.stringify(state))), 4000); } catch (e) { dbPromise = null; }
   }
 
   /* =====================================================================
@@ -195,20 +191,18 @@
     rec.updatedAt = Date.now();
     state.data[col][rec.id] = rec;
     state.dirty[col + "/" + rec.id] = 1;
-    persist();
+    persistNow();
     scheduleSync();
     return rec;
   }
   function softDelete(col, id) { const r = state.data[col][id]; if (r) { r.deleted = true; save(col, r); } }
 
-  // Money owed TO suppliers
   function supplierSummary(id) {
     const s = state.data.suppliers[id];
     let billed = s ? num(s.openingPayable) : 0, paid = 0;
     live("purchases").forEach((p) => { if (p.supplierId === id) { billed += num(p.total); paid += num(p.paid); } });
     return { billed: r2(billed), paid: r2(paid), balance: r2(billed - paid) };
   }
-  // Money owed BY shops
   function shopSummary(id) {
     const s = state.data.shops[id];
     let billed = s ? num(s.openingCredit) : 0, paid = 0;
@@ -242,78 +236,15 @@
   function applyTheme() { document.documentElement.setAttribute("data-theme", state.theme === "dark" ? "dark" : "light"); }
 
   /* =====================================================================
-     5. FIREBASE SYNC
+     5. LOCAL-ONLY MODE (FIREBASE DISABLED)
      ===================================================================== */
-  let syncing = false, syncTimer = null, syncState = "idle", syncErr = "";
+  let syncing = false, syncTimer = null, syncState = "local", syncErr = "";
   const online = () => navigator.onLine !== false;
   const pending = () => Object.keys(state.dirty).length;
-  const url = (path) => dbBase().replace(/\/+$/, "") + "/" + CFG.ROOT + (path ? "/" + path : "") + ".json";
-
-  async function fetchRoot() {
-    const r = await fetch(url(""), { cache: "no-store" });
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    return r.json();
-  }
-  function mergeRemote(root) {
-    if (!root) return false;
-    let changed = false;
-    COLS.forEach((col) => {
-      const rc = root[col];
-      if (!rc || typeof rc !== "object") return;
-      Object.keys(rc).forEach((id) => {
-        const rv = rc[id];
-        if (!rv || typeof rv !== "object") return;
-        const lv = state.data[col][id];
-        if (!lv || (rv.updatedAt || 0) > (lv.updatedAt || 0)) {
-          state.data[col][id] = rv;
-          delete state.dirty[col + "/" + id];
-          changed = true;
-        }
-      });
-    });
-    return changed;
-  }
-  async function push() {
-    const keys = Object.keys(state.dirty);
-    for (let i = 0; i < keys.length; i += 4) {
-      await Promise.all(keys.slice(i, i + 4).map(async (k) => {
-        const [col, id] = k.split("/");
-        const rec = state.data[col] && state.data[col][id];
-        if (!rec) { delete state.dirty[k]; return; }
-        const stamp = rec.updatedAt;
-        const r = await fetch(url(k), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(rec) });
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        const now = state.data[col][id];
-        if (now && now.updatedAt === stamp) delete state.dirty[k];
-      }));
-    }
-  }
-  function scheduleSync() { clearTimeout(syncTimer); syncTimer = setTimeout(() => sync(false), CFG.SYNC_DEBOUNCE); updateStatus(); }
-
-  async function sync(manual) {
-    if (syncing) return manual ? "busy" : undefined;
-    if (!online()) { updateStatus(); return "offline"; }
-    syncing = true; syncState = "busy"; syncErr = ""; updateStatus();
-    let changed = false;
-    try { await push(); } catch (e) { syncErr = String((e && e.message) || e); }
-    try { changed = mergeRemote(await fetchRoot()); } catch (e) { syncErr = syncErr || String((e && e.message) || e); }
-    if (!syncErr) {
-      state.lastSync = Date.now(); syncState = "ok";
-      if (changed) { try { await push(); } catch (e) { /* retry next time */ } }
-    } else { syncState = "err"; }
-    syncing = false;
-    persist(); updateStatus();
-    if (changed) softRefresh();
-    return syncState;
-  }
-
+  function scheduleSync() { state.dirty = {}; updateStatus(); }
+  async function sync() { state.dirty = {}; syncState = "local"; updateStatus(); return "local"; }
   function statusText() {
-    const n = pending();
-    if (!online()) return ["off", "ഓഫ്‌ലൈൻ" + (n ? " • " + n + " മാറ്റം അയക്കാനുണ്ട്" : " • ഫോണിൽ സേവ് ആകുന്നു")];
-    if (syncState === "busy") return ["busy", "സിങ്ക് ചെയ്യുന്നു…"];
-    if (syncState === "err") return ["err", "സെർവർ ലഭ്യമല്ല (" + syncErr + ")" + (n ? " • " + n + " മാറ്റം പിന്നീട് അയക്കും" : "")];
-    if (n) return ["", "ഓൺലൈൻ • " + n + " മാറ്റം അയക്കാനുണ്ട്"];
-    return ["", "ഓൺലൈൻ • സിങ്ക് പൂർത്തിയായി"];
+    return ["", "ഫോണിൽ സേവ് ആകുന്നു (Local Device)"];
   }
   function updateStatus() {
     const d = $("#syncDot"), t = $("#syncText");
@@ -322,7 +253,6 @@
     d.className = "dot " + s[0];
     t.textContent = s[1];
   }
-
 
   /* =====================================================================
      6. UI PLUMBING: toast, modal
@@ -354,7 +284,6 @@
   function modalErr(msg) { const e = $("#modalErr"); if (e) { e.textContent = msg; e.hidden = false; } return false; }
   function confirmBox(title, text, okLabel, fn) { openModal({ title, text, ok: okLabel, danger: true, focus: false, onOk: fn }); }
 
-
   /* =====================================================================
      7. LOGIN
      ===================================================================== */
@@ -366,7 +295,7 @@
     return '<div class="login"><div class="login-card"><div class="login-head"><div class="logo">MTP</div><h1>' + h(b.name) + '</h1><div class="tag">' + h(b.tag) + "</div>" + (b.place || b.phone ? '<div class="loc">' + (b.place ? "📍 " + h(b.place) : "") + (b.phone ? " • 📞 " + h(b.phone) : "") + "</div>" : "") + "</div>" +
       '<div class="login-body"><h2>സുരക്ഷാ പിൻ നൽകുക</h2><p>അഡ്മിൻ അല്ലെങ്കിൽ സ്റ്റാഫ് പിൻ ടൈപ്പ് ചെയ്യുക</p><div class="dots" id="dots">' + dots + '</div><div class="pin-err" id="pinErr"></div>' +
       '<div class="pad">' + keys + '<button type="button" class="sec" data-act="pin-clear">CLEAR</button><button type="button" data-act="pin" data-k="0">0</button><button type="button" class="sec2" data-act="pin-back" aria-label="Backspace">' + ICON.delete + "</button></div>" +
-      '<div class="sync-note"><span class="dot ' + statusText()[0] + '" id="syncDot"></span><span id="syncText">' + h(statusText()[1]) + '</span></div><button type="button" class="linkbtn" data-act="db-url">Firebase വിലാസം</button></div></div></div>';
+      '<div class="sync-note"><span class="dot ' + statusText()[0] + '" id="syncDot"></span><span id="syncText">' + h(statusText()[1]) + '</span></div></div></div></div>';
   }
   function updateDots() { const d = $("#dots"); if (d) d.innerHTML = [0, 1, 2, 3].map((i) => '<i class="' + (i < pin.length ? "on" : "") + '"></i>').join(""); }
   function pinMsg(msg) { const e = $("#pinErr"); if (e) e.textContent = msg || ""; }
@@ -374,21 +303,20 @@
   async function verifyPin() {
     const entered = pin, now = Date.now();
     if (state.lock.until > now) { pin = ""; updateDots(); pinMsg("കുറച്ച് സമയത്തിന് ശേഷം ശ്രമിക്കുക (" + Math.ceil((state.lock.until - now) / 1000) + " സെക്കൻഡ്)"); return; }
-    if (!state.lastSync && online()) { pinMsg("പരിശോധിക്കുന്നു…"); try { await withTimeout(sync(true), 8000); } catch (e) { /* use local */ } pinMsg(""); }
     const hs = pinHash(entered);
     let sess = null;
     if (hs === S().adminHash) sess = { role: "admin", name: "അഡ്മിൻ", canProfit: true };
     else { const st = live("staff").find((x) => x.pinHash === hs); if (st) sess = { role: "staff", name: st.name, code: st.id, canProfit: !!st.canProfit }; }
     if (sess) {
-      state.lock = { n: 0, until: 0 }; persist();
+      state.lock = { n: 0, until: 0 }; await persistNow();
       pin = ""; session = sess; ui.mode = "purchase"; ui.pane = "entry";
-      autoBackupCheck(); render(); toast("സ്വാഗതം " + sess.name); sync(false);
+      autoBackupCheck(); render(); toast("സ്വാഗതം " + sess.name);
       return;
     }
     state.lock.n++;
     if (state.lock.n >= CFG.MAX_TRIES) { state.lock = { n: 0, until: Date.now() + CFG.LOCK_MS }; pinMsg("5 തവണ തെറ്റി. 30 സെക്കൻഡ് കാത്തിരിക്കുക."); }
     else pinMsg("തെറ്റായ പിൻ! (" + (CFG.MAX_TRIES - state.lock.n) + " ശ്രമങ്ങൾ ബാക്കി)");
-    persist(); pin = ""; updateDots();
+    await persistNow(); pin = ""; updateDots();
     const d = $("#dots"); if (d) { d.classList.remove("shake"); void d.offsetWidth; d.classList.add("shake"); }
   }
   function logout() { session = null; pin = ""; modal = null; renderModal(); render(); }
@@ -399,8 +327,7 @@
   const isStandalone = () => window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
   const paneList = () => {
     const pm = ui.mode === "purchase";
-    const l = [["entry", pm ? "പർച്ചേസ്" : "സെയിൽസ്", pm ? "cart" : "receipt"], ["parties", pm ? "സപ്ലയർമാർ" : "കടകൾ", pm ? "truck" : "store"], ["reports", "റിപ്പോർട്ട്", "chart"], ["admin", isAdmin() ? "അഡ്മിൻ" : "ബാക്കപ്പ്", "shield"]];
-    return l;
+    return [["entry", pm ? "പർച്ചേസ്" : "സെയിൽസ്", pm ? "cart" : "receipt"], ["parties", pm ? "സപ്ലയർമാർ" : "കടകൾ", pm ? "truck" : "store"], ["reports", "റിപ്പോർട്ട്", "chart"], ["admin", isAdmin() ? "അഡ്മിൻ" : "ബാക്കപ്പ്", "shield"]];
   };
   function render() {
     const root = $("#root");
@@ -478,7 +405,7 @@
     if (src !== "p_total") { const t = $("#p_total"); if (q > 0 && r > 0) t.value = r2(q * r); }
     else if (q > 0) { $("#p_rate").value = r2(num($("#p_total").value) / q); }
   }
-  function purchaseSupInfo() { const s = byId("suppliers", $("#p_sup") && $("#p_sup").value), el = $("#p_supinfo"); if (el) el.textContent = s ? (s.phone ? "📞 " + s.phone + "  " : "") + (s.place ? "📍 " + s.place + "  " : "") + "• കൊടുക്കാനുള്ളത്: " + money(supplierSummary(s.id).balance) : ""; }
+  function purchaseSupInfo() { const s = byId("suppliers", $("#p_sup") && $("#p_sup").value), el = $("#p_supinfo"); if (el) el.textContent = s ? (s.phone ? "📞 " + s.phone + " " : "") + (s.place ? "📍 " + s.place + " " : "") + "• കൊടുക്കാനുള്ളത്: " + money(supplierSummary(s.id).balance) : ""; }
 
   /* ---------- SALES entry ---------- */
   function rowHtml(it) {
@@ -511,7 +438,7 @@
     const raw = $("#s_paid") ? $("#s_paid").value : ""; const paid = raw === "" ? t : num(raw);
     const c = $("#s_credit"); if (c) c.textContent = money(Math.max(0, r2(t - paid)));
   }
-  function salesShopInfo() { const s = byId("shops", $("#s_shop") && $("#s_shop").value), el = $("#s_shopinfo"); if (el) el.textContent = s ? (s.phone ? "📞 " + s.phone + "  " : "") + (s.place ? "📍 " + s.place + "  " : "") + "• ബാക്കി കടം: " + money(shopSummary(s.id).balance) : ""; }
+  function salesShopInfo() { const s = byId("shops", $("#s_shop") && $("#s_shop").value), el = $("#s_shopinfo"); if (el) el.textContent = s ? (s.phone ? "📞 " + s.phone + " " : "") + (s.place ? "📍 " + s.place + " " : "") + "• ബാക്കി കടം: " + money(shopSummary(s.id).balance) : ""; }
   function salesListInner() {
     const q = norm(ui.sSearch);
     const arr = live("sales").filter((s) => (s.date || "").startsWith(ui.sMonth) && (!q || norm(s.shopName + " " + (s.billNo || "")).includes(q))).sort((a, b) => (b.date + (b.billNo || "")).localeCompare(a.date + (a.billNo || "")) || b.updatedAt - a.updatedAt);
@@ -568,13 +495,12 @@
         '<section class="card"><div class="row between pad-s"><div><h2>ഉൽപ്പന്നങ്ങളും വിലയും</h2><div class="muted">വിതരണ ബില്ലിൽ ഉപയോഗിക്കുന്നവ</div></div><button type="button" class="btn" data-act="add-product">' + ICON.plus + 'പുതിയ</button></div><div class="list">' + (sortedProducts().length ? sortedProducts().map((p) => '<div class="li"><div class="grow"><div class="t">' + h(p.name) + '</div><div class="s">' + h(p.unit) + '</div></div><div class="amt">' + money(p.price) + '</div><button type="button" class="btn sm ghost" data-act="edit-product" data-id="' + h(p.id) + '">' + ICON.edit + '</button><button type="button" class="btn sm ghost red" data-act="del-product" data-id="' + h(p.id) + '">' + ICON.trash + "</button></div>").join("") : emptyBox("ഉൽപ്പന്നങ്ങൾ ഇല്ല")) + "</div></section>" +
         '<section class="card"><div class="row between pad-s"><div><h2>സ്റ്റാഫ്</h2><div class="muted">ഓരോരുത്തർക്കും സ്വന്തം 4 അക്ക പിൻ</div></div><button type="button" class="btn" data-act="add-staff">' + ICON.plus + 'പുതിയ</button></div><div class="list">' + (live("staff").length ? live("staff").sort(byName).map((p) => '<div class="li"><div class="av">' + h(initial(p.name)) + '</div><div class="grow"><div class="t">' + h(p.name) + '</div><div class="s">' + (p.canProfit ? "ലാഭം കാണാം" : "ലാഭം മറച്ചത്") + '</div></div><button type="button" class="btn sm ghost" data-act="edit-staff" data-id="' + h(p.id) + '">' + ICON.edit + '</button><button type="button" class="btn sm ghost red" data-act="del-staff" data-id="' + h(p.id) + '">' + ICON.trash + "</button></div>").join("") : emptyBox("സ്റ്റാഫ് ഇല്ല")) + "</div></section>";
     }
-    o += '<section class="card stack"><h2>ബാക്കപ്പ് & സിങ്ക്</h2><div class="banner green" id="syncBanner">' + h(statusText()[1]) + (state.lastSync ? " • അവസാന സിങ്ക്: " + new Date(state.lastSync).toLocaleString("en-IN") : "") + '</div><div class="muted">ഡാറ്റ ബേസ്: ' + h(dbBase()) + '</div><div class="row wrap"><button type="button" class="btn" data-act="sync-now">' + ICON.refresh + 'സിങ്ക്</button><button type="button" class="btn ghost" data-act="snapshot">ഫോൺ ബാക്കപ്പ്</button><button type="button" class="btn ghost" data-act="export">' + ICON.download + 'JSON</button>' +
-      (isAdmin() ? '<label class="btn ghost" style="cursor:pointer">' + ICON.upload + 'റീസ്റ്റോർ<input type="file" accept=".json,application/json" data-ch="restore-file" hidden></label><button type="button" class="btn ghost" data-act="db-url">Firebase വിലാസം</button>' : "") + '</div><div id="snapList" class="stack"><div class="muted">ലോഡ് ചെയ്യുന്നു…</div></div></section>';
+    o += '<section class="card stack"><h2>ബാക്കപ്പ്</h2><div class="banner green" id="syncBanner">' + h(statusText()[1]) + '</div><div class="row wrap"><button type="button" class="btn ghost" data-act="snapshot">ഫോൺ ബാക്കപ്പ്</button><button type="button" class="btn ghost" data-act="export">' + ICON.download + 'JSON</button>' +
+      (isAdmin() ? '<label class="btn ghost" style="cursor:pointer">' + ICON.upload + 'റീസ്റ്റോർ<input type="file" accept=".json,application/json" data-ch="restore-file" hidden></label>' : "") + '</div><div id="snapList" class="stack"><div class="muted">ലോഡ് ചെയ്യുന്നു…</div></div></section>';
     getSnapshots().then((arr) => { snapCache = arr; const el = $("#snapList"); if (el) el.innerHTML = arr.length ? arr.map((b) => '<div class="li" style="border:1px solid var(--line);border-radius:13px"><div class="grow"><div class="t">' + h(b.label) + '</div><div class="s">' + h(b.ts) + "</div></div>" + (isAdmin() ? '<button type="button" class="btn sm ghost" data-act="restore-snap" data-id="' + h(b.id) + '">Restore</button>' : "") + "</div>").join("") : '<div class="muted">ഫോൺ ബാക്കപ്പുകൾ ഇല്ല</div>'; });
     return o;
   }
 
-  /* --- canvas → JPEG → minimal PDF (works offline; browser shapes Malayalam correctly) --- */
   const PW = 1240, PH = 1754, MX = 80, TOP = 200, BOT = 110;
   const FONT = '"Noto Sans Malayalam","Noto Sans","Manjari","Meera","Nirmala UI","Kartika",system-ui,sans-serif';
   const fit = (ctx, str, maxW) => { if (ctx.measureText(str).width <= maxW) return str; const g = segs(str); while (g.length > 1 && ctx.measureText(g.join("") + "…").width > maxW) g.pop(); return g.join("") + "…"; };
@@ -590,7 +516,7 @@
       x.fillStyle = "#fbbf24"; x.fillRect(0, 170, PW, 8);
       this.c = c; this.x = x; this.pages.push(c);
       const b = S().biz;
-      this.t(b.name + "  •  " + b.place + "  •  " + b.phone, MX, 40, { size: 22, weight: 600, color: "#bfdbfe", maxW: PW - 2 * MX });
+      this.t(b.name + " • " + b.place + " • " + b.phone, MX, 40, { size: 22, weight: 600, color: "#bfdbfe", maxW: PW - 2 * MX });
       this.t(this.title, MX, 92, { size: 44, weight: 800, color: "#fff", maxW: PW - 2 * MX });
       this.t(this.subtitle, MX, 140, { size: 27, weight: 600, color: "#dbeafe", maxW: PW - 2 * MX });
       this.y = TOP;
@@ -634,7 +560,7 @@
       return this.pages;
     }
   }
-  async function ensureFonts() { try { if (document.fonts && document.fonts.load) { await Promise.all([500, 600, 700, 800].map((w) => document.fonts.load(w + ' 26px "Noto Sans Malayalam"', "മലയാളം 1234"))); await document.fonts.ready; } } catch (e) { /* fallback fonts */ } }
+  async function ensureFonts() { try { if (document.fonts && document.fonts.load) { await Promise.all([500, 600, 700, 800].map((w) => document.fonts.load(w + ' 26px "Noto Sans Malayalam"', "മലയാളം 1234"))); await document.fonts.ready; } } catch (e) {} }
   function pdfFromCanvases(canvases) {
     const enc = new TextEncoder(), chunks = [], offs = []; let pos = 0;
     const push = (d) => { const b = typeof d === "string" ? enc.encode(d) : d; chunks.push(b); pos += b.length; };
@@ -657,14 +583,12 @@
     const out = new Uint8Array(pos); let o = 0; chunks.forEach((c) => { out.set(c, o); o += c.length; }); return out;
   }
 
-
   async function buildReportPdf(m) {
     await ensureFonts();
     const d = reportData(m), cp = canProfit();
     const doc = new PdfDoc("പ്രതിമാസ റിപ്പോർട്ട്", fmtMonth(m));
     doc.kpis([{ label: "വിൽപ്പന", value: money(d.sales) }, { label: "ലഭിച്ചത്", value: money(d.received), bg: "#eff6ff", color: "#1d4ed8" }, { label: "പർച്ചേസ്", value: money(d.purchase), bg: "#fffbeb", color: "#b45309" }]);
-    const k2 = [{ label: "സപ്ലയർക്ക് നൽകിയത്", value: money(d.paidOut), bg: "#fffbeb", color: "#b45309" }, { label: "കിട്ടാനുള്ളത്", value: money(totalCredit()), bg: "#fff1f2", color: "#be123c" }, { label: "കൊടുക്കാനുള്ളത്", value: money(totalPayable()), bg: "#fff1f2", color: "#be123c" }];
-    doc.kpis(k2);
+    doc.kpis([{ label: "സപ്ലയർക്ക് നൽകിയത്", value: money(d.paidOut), bg: "#fffbeb", color: "#b45309" }, { label: "കിട്ടാനുള്ളത്", value: money(totalCredit()), bg: "#fff1f2", color: "#be123c" }, { label: "കൊടുക്കാനുള്ളത്", value: money(totalPayable()), bg: "#fff1f2", color: "#be123c" }]);
     if (cp) doc.kv("ലാഭം (വിൽപ്പന − പർച്ചേസ്)", money(d.sales - d.purchase), { bold: true, color: d.sales - d.purchase >= 0 ? "#047857" : "#be123c" });
     doc.heading("ഉൽപ്പന്നം തിരിച്ചുള്ള വിൽപ്പന");
     doc.table([{ label: "ഉൽപ്പന്നം", w: 0.56 }, { label: "അളവ്", w: 0.18, align: "right" }, { label: "തുക", w: 0.26, align: "right", bold: true, color: "#047857" }],
@@ -677,7 +601,7 @@
   }
   async function buildBillPdf(inv) {
     await ensureFonts();
-    const doc = new PdfDoc("ബിൽ " + inv.billNo, inv.shopName + "  •  " + fmtDate(inv.date) + (inv.shopPhone ? "  •  Ph: " + inv.shopPhone : ""));
+    const doc = new PdfDoc("ബിൽ " + inv.billNo, inv.shopName + " • " + fmtDate(inv.date) + (inv.shopPhone ? " • Ph: " + inv.shopPhone : ""));
     doc.table([{ label: "ഉൽപ്പന്നം", w: 0.42 }, { label: "അളവ്", w: 0.14, align: "center" }, { label: "നിരക്ക്", w: 0.18, align: "right" }, { label: "തുക", w: 0.26, align: "right", bold: true, color: "#047857" }],
       (inv.items || []).map((i) => ({ cells: [i.name, kgFmt(i.qty) + " " + i.unit, num(i.rate).toFixed(2), num(i.amount).toFixed(2)] })));
     doc.kv("ആകെ ബിൽ", money(inv.total), { bold: true, size: 34, line: true, gap: 66 });
@@ -737,20 +661,6 @@
       }
     });
   }
-  function dbModal() {
-    openModal({
-      title: "Firebase ഡാറ്റാബേസ് വിലാസം",
-      text: "Firebase Console → Realtime Database പേജിന്റെ മുകളിൽ കാണുന്ന https://…firebasedatabase.app (അല്ലെങ്കിൽ …firebaseio.com) വിലാസം. mtp-honey.web.app (Hosting) ഇവിടെ പാടില്ല.",
-      body: '<label class="f">വിലാസം<input id="mf_url" class="in" inputmode="url" autocapitalize="off" value="' + h(dbBase()) + '"></label>',
-      ok: "സേവ്",
-      onOk() {
-        let u = clean(mv("url")).replace(/\/+$/, "");
-        if (!/^https:\/\/[a-z0-9-]+(-default-rtdb)?(\.[a-z0-9-]+)*\.(firebaseio\.com|firebasedatabase\.app)$/i.test(u)) return modalErr("ശരിയായ Realtime Database വിലാസം നൽകുക (…firebaseio.com / …firebasedatabase.app).");
-        try { localStorage.setItem(CFG.DB_KEY, u); } catch (e) { /* ignore */ }
-        syncErr = ""; syncState = "idle"; updateStatus(); toast("വിലാസം സേവ് ചെയ്തു"); sync(true).then(() => { updateStatus(); if (session) render(); });
-      }
-    });
-  }
   function stmtEntries(kind, p) {
     const out = [];
     if (kind === "shop") { if (num(p.openingCredit)) out.push({ date: "0000", label: "പഴയ ബാക്കി", debit: num(p.openingCredit), credit: 0 }); live("sales").filter((x) => x.shopId === p.id).forEach((x) => { out.push({ date: x.date, label: x.kind === "sale" ? "ബിൽ " + x.billNo : "പണം വരവ്", debit: x.kind === "sale" ? num(x.total) : 0, credit: num(x.paid) }); }); }
@@ -801,23 +711,22 @@
   }
   const delConfirm = (title, text, fn) => confirmBox(title, text, "നീക്കം ചെയ്യുക", () => { fn(); toast("നീക്കം ചെയ്തു", "warn"); render(); });
 
-  /* ---------- backups ---------- */
   function dataSnapshot() { const o = {}; BACKUP_COLS.forEach((c) => { o[c] = JSON.parse(JSON.stringify(state.data[c])); }); return o; }
   async function createSnapshot(label) {
     const arr = await getSnapshots();
     arr.unshift({ id: "bk" + Date.now(), label, ts: new Date().toLocaleString("en-IN"), data: dataSnapshot() });
-    try { await idbSet("snapshots", arr.slice(0, 15)); } catch (e) { /* ignore */ }
+    try { await idbSet("snapshots", arr.slice(0, 15)); } catch (e) {}
   }
-  async function autoBackupCheck() { const t = todayIso(); if (state.lastAutoBackup !== t) { state.lastAutoBackup = t; persist(); await createSnapshot("Auto Backup (" + t + ")"); } }
+  async function autoBackupCheck() { const t = todayIso(); if (state.lastAutoBackup !== t) { state.lastAutoBackup = t; await persistNow(); await createSnapshot("Auto Backup (" + t + ")"); } }
   function restoreData(data) {
     const now = Date.now();
     BACKUP_COLS.forEach((col) => {
       const src = data[col]; if (!src) return;
       const map = Array.isArray(src) ? Object.fromEntries(src.filter((r) => r && r.id).map((r) => [r.id, r])) : src;
-      Object.keys(state.data[col]).forEach((id) => { if (!map[id] && !state.data[col][id].deleted) { state.data[col][id].deleted = true; state.data[col][id].updatedAt = now; state.dirty[col + "/" + id] = 1; } });
-      Object.keys(map).forEach((id) => { state.data[col][id] = Object.assign({}, map[id], { id, deleted: !!map[id].deleted, updatedAt: now }); state.dirty[col + "/" + id] = 1; });
+      Object.keys(state.data[col]).forEach((id) => { if (!map[id] && !state.data[col][id].deleted) { state.data[col][id].deleted = true; state.data[col][id].updatedAt = now; } });
+      Object.keys(map).forEach((id) => { state.data[col][id] = Object.assign({}, map[id], { id, deleted: !!map[id].deleted, updatedAt: now }); });
     });
-    persist(); scheduleSync();
+    persistNow();
   }
   function download(blob, name) {
     const u = URL.createObjectURL(blob), a = document.createElement("a");
@@ -829,11 +738,10 @@
     "pin-back"() { pin = pin.slice(0, -1); updateDots(); },
     "pin-clear"() { pin = ""; updateDots(); pinMsg(""); },
     logout,
-    theme() { state.theme = state.theme === "dark" ? "light" : "dark"; applyTheme(); persist(); render(); },
-    install: async function () { if (installPrompt) { installPrompt.prompt(); try { await installPrompt.userChoice; } catch (e) { /* ignore */ } installPrompt = null; } else toast("ബ്രൗസർ മെനുവിലെ 'Install app' / 'Add to Home Screen' ഉപയോഗിക്കുക."); },
+    theme() { state.theme = state.theme === "dark" ? "light" : "dark"; applyTheme(); persistNow(); render(); },
+    install: async function () { if (installPrompt) { installPrompt.prompt(); try { await installPrompt.userChoice; } catch (e) {} installPrompt = null; } else toast("ബ്രൗസർ മെനുവിലെ 'Install app' / 'Add to Home Screen' ഉപയോഗിക്കുക."); },
     mode(el) { ui.mode = el.dataset.m; ui.pane = "entry"; ui.editPurchase = null; ui.editSale = null; render(); },
     pane(el) { ui.pane = el.dataset.p; render(); window.scrollTo(0, 0); },
-    "db-url": dbModal,
 
     "add-supplier"() { partyModal("supplier"); },
     "edit-supplier"(el) { const r = byId("suppliers", el.dataset.id); if (r) partyModal("supplier", r); },
@@ -854,7 +762,6 @@
       openWa(s.phone, "നമസ്കാരം, " + s.name + ".\n" + b.name + " ലേക്ക് ₹" + bal + " ബാക്കി നൽകാനുണ്ട്" + (s.dueDate ? " (അവധി: " + fmtDate(s.dueDate) + ")" : "") + ". ദയവായി പണം നൽകണമെന്ന് അഭ്യർത്ഥിക്കുന്നു. നന്ദി 🙏");
     },
 
-    /* purchases */
     "save-purchase"() {
       const sup = byId("suppliers", $("#p_sup").value), item = clean($("#p_item").value), qty = num($("#p_qty").value), rate = num($("#p_rate").value), date = $("#p_date").value;
       if (!sup) return toast("സപ്ലയറെ തിരഞ്ഞെടുക്കുക", "error");
@@ -872,7 +779,6 @@
     "cancel-purchase"() { ui.editPurchase = null; render(); },
     "del-purchase"(el) { const p = byId("purchases", el.dataset.id); if (p && isAdmin()) delConfirm("എൻട്രി നീക്കം ചെയ്യണോ?", p.supplierName + " — " + money(p.total || p.paid), () => softDelete("purchases", p.id)); },
 
-    /* sales */
     "add-row"() { if (!sortedProducts().length) return toast("ഉൽപ്പന്നങ്ങൾ ഇല്ല", "warn"); $("#s_rows").insertAdjacentHTML("beforeend", rowHtml()); recalcSale(); },
     "rm-row"(el) { if ($$("#s_rows .srow").length <= 1) return toast("കുറഞ്ഞത് ഒരു ഇനം വേണം", "warn"); el.closest(".srow").remove(); recalcSale(); },
     "save-sale"() {
@@ -899,14 +805,12 @@
     "inv-print"() { window.print(); },
     async "inv-pdf"(el) { const inv = byId("sales", modal && modal.invId); if (!inv) return; el.disabled = true; try { download(new Blob([await buildBillPdf(inv)], { type: "application/pdf" }), inv.billNo + ".pdf"); toast("PDF ഡൗൺലോഡ് ചെയ്തു"); } catch (e) { toast("PDF നിർമ്മിക്കാൻ കഴിഞ്ഞില്ല", "error"); } el.disabled = false; },
 
-    /* reports */
     async "report-pdf"(el) { el.disabled = true; try { download(new Blob([await buildReportPdf(ui.rMonth || monthNow())], { type: "application/pdf" }), "MTP_Honey_Report_" + (ui.rMonth || monthNow()) + ".pdf"); toast("PDF ഡൗൺലോഡ് ചെയ്തു"); } catch (e) { toast("PDF നിർമ്മിക്കാൻ കഴിഞ്ഞില്ല", "error"); } el.disabled = false; },
     "report-wa"() {
       const m = ui.rMonth || monthNow(), d = reportData(m), b = S().biz;
       openWa("", ["*" + b.name + " — " + fmtMonth(m) + "*", "------------------------", "വിൽപ്പന: *₹" + d.sales + "*", "ലഭിച്ചത്: ₹" + d.received, "പർച്ചേസ്: *₹" + d.purchase + "*", "നൽകിയത്: ₹" + d.paidOut].concat(canProfit() ? ["ലാഭം: *₹" + r2(d.sales - d.purchase) + "*"] : []).concat(["കിട്ടാനുള്ളത്: ₹" + totalCredit(), "കൊടുക്കാനുള്ളത്: ₹" + totalPayable()]).join("\n"));
     },
 
-    /* admin */
     "save-pin"() {
       const a = $("#a_pin").value.trim(); if (!/^\d{4}$/.test(a)) return toast("പിൻ 4 അക്ക നമ്പർ ആയിരിക്കണം", "error");
       const hs = pinHash(a); if (live("staff").some((x) => x.pinHash === hs)) return toast("ഈ പിൻ ഒരു സ്റ്റാഫിന്റേതാണ്", "error");
@@ -924,7 +828,6 @@
     "edit-staff"(el) { const r = byId("staff", el.dataset.id); if (r) staffModal(r); },
     "del-staff"(el) { const r = byId("staff", el.dataset.id); if (r && isAdmin()) delConfirm("സ്റ്റാഫിനെ നീക്കം ചെയ്യണോ?", r.name, () => softDelete("staff", r.id)); },
     "sw-profit"(el) { el.classList.toggle("on"); },
-    async "sync-now"(el) { el.disabled = true; const r = await sync(true); el.disabled = false; toast(r === "ok" ? "സിങ്ക് പൂർത്തിയായി" : r === "offline" ? "ഓഫ്‌ലൈൻ ആണ്" : "സിങ്ക് പരാജയപ്പെട്ടു: " + syncErr, r === "ok" ? "" : "error"); if (ui.pane === "admin") render(); },
     async snapshot() { await createSnapshot("Manual Backup (" + todayIso() + ")"); toast("✅ ഫോണിൽ ബാക്കപ്പ് എടുത്തു"); render(); },
     export() { download(new Blob([JSON.stringify({ app: "mtp-honey", v: 1, exportedAt: new Date().toISOString(), data: dataSnapshot() }, null, 2)], { type: "application/json" }), "MTP_Honey_Backup_" + todayIso() + ".json"); toast("📥 ഡൗൺലോഡ് ചെയ്തു"); },
     "restore-snap"(el) { if (!isAdmin()) return; const b = snapCache.find((x) => x.id === el.dataset.id); if (!b) return; confirmBox("റീസ്റ്റോർ ചെയ്യണോ?", b.label + " — നിലവിലെ ഡാറ്റ മാറ്റപ്പെടും.", "റീസ്റ്റോർ", () => { restoreData(b.data); toast("✅ റീസ്റ്റോർ ചെയ്തു"); render(); }); },
@@ -977,14 +880,11 @@
       if (!session && !modal && ev.key === "Backspace") { actions["pin-back"](); return; }
       if (ev.key === "Enter" && modal && ev.target.tagName === "INPUT" && modal.onOk) { ev.preventDefault(); actions["modal-ok"](); }
     });
-    window.addEventListener("online", () => { updateStatus(); sync(false); });
+    window.addEventListener("online", updateStatus);
     window.addEventListener("offline", updateStatus);
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") { hiddenAt = Date.now(); persistNow(); }
-      else {
-        if (session && hiddenAt && Date.now() - hiddenAt > CFG.AUTOLOCK_MS) { logout(); toast("സുരക്ഷയ്ക്കായി ലോക്ക് ചെയ്തു"); }
-        if (online()) sync(false);
-      }
+      else if (session && hiddenAt && Date.now() - hiddenAt > CFG.AUTOLOCK_MS) { logout(); toast("സുരക്ഷയ്ക്കായി ലോക്ക് ചെയ്തു"); }
     });
     window.addEventListener("pagehide", persistNow);
     window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); installPrompt = e; const b = $("#btnInstall"); if (b) b.hidden = false; });
@@ -996,11 +896,6 @@
     applyTheme(); wire(); render();
     if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1")) navigator.serviceWorker.register("sw.js").catch(() => {});
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
-    if (online()) sync(false);
-    setInterval(() => { if (online() && document.visibilityState === "visible" && !syncing) sync(false); }, CFG.POLL_MS);
-    if (window.__MTH_TEST) {
-      window.__MTH = { state: () => state, setSession: (r) => { session = r ? { role: r, name: r, canProfit: r === "admin" } : null; }, ui: () => ui, render, actions, mergeRemote, save, restoreData, buildReportPdf, buildBillPdf, reportData, pinHash, verifyPin, setPin: (p) => { pin = p; }, supplierSummary, shopSummary, nextBillNo, totalPayable, totalCredit, isOverdue, live, S, todayIso, session: () => session };
-    }
   }
   boot();
 })();
