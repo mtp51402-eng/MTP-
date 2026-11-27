@@ -1,5 +1,5 @@
 /* MTP Honey — വാങ്ങൽ, പ്രൊഡക്ഷൻ & വിതരണം
-   Offline-first PWA. Data: IndexedDB (device) ⇄ Firebase Realtime Database (REST). */
+   Offline-first PWA. Data: localStorage + IndexedDB (device) ⇄ Firebase Realtime Database (REST). */
 (function () {
   "use strict";
 
@@ -11,8 +11,8 @@
     ROOT: "mtp-honey-v1",
     IDB: "mtp-honey",
     DB_KEY: "mth_db_url",
-    SYNC_DEBOUNCE: 1200,
-    POLL_MS: 45000,
+    SYNC_DEBOUNCE: 600,
+    POLL_MS: 30000,
     AUTOLOCK_MS: 5 * 60 * 1000,
     MAX_TRIES: 5,
     LOCK_MS: 30000
@@ -37,7 +37,6 @@
   const norm = (s) => clean(s).toLowerCase();
   const money = (n) => "₹" + (Number(n) || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 });
   const kgFmt = (n) => (Math.round((Number(n) || 0) * 100) / 100).toLocaleString("en-IN", { maximumFractionDigits: 2 });
-  // Local calendar date (NOT UTC) — fixes wrong "today" in India before 5:30 AM
   const isoOf = (d) => d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
   const todayIso = () => isoOf(new Date());
   const monthNow = () => todayIso().slice(0, 7);
@@ -128,8 +127,8 @@
     };
   }
   let state = defaultState();
-  let session = null; // { role:'admin'|'staff', name, code, canProfit }
-  let ui = { mode: "purchase", pane: "p_entry", pMonth: monthNow(), pSearch: "", sMonth: monthNow(), sSearch: "", rMonth: monthNow(), editPurchase: null, editSale: null };
+  let session = null;
+  let ui = { mode: "purchase", pane: "entry", pMonth: monthNow(), pSearch: "", sMonth: monthNow(), sSearch: "", rMonth: monthNow(), editPurchase: null, editSale: null };
   let persistTimer = null, dbPromise = null;
 
   const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
@@ -140,7 +139,7 @@
         const q = indexedDB.open(CFG.IDB, 1);
         q.onupgradeneeded = () => q.result.createObjectStore("kv");
         q.onsuccess = () => res(q.result);
-        q.onerror = () => rej(q.error);
+        q.onerror = () => { dbPromise = null; rej(q.error); };
       });
     }
     return dbPromise;
@@ -151,17 +150,16 @@
   let idbSkip = false;
   async function loadState() {
     const base = defaultState();
-    // ഡാറ്റ രണ്ട് സ്ഥലത്ത് (localStorage + IndexedDB) സേവ് ചെയ്യുന്നു; പുതിയ കോപ്പി എടുക്കും
     let a = { ok: false };
     for (let i = 0; i < 3 && !a.ok; i++) {
-      try { a = { ok: true, v: await withTimeout(idbGet("state"), 5000) }; } catch (e) { dbPromise = null; await new Promise((r) => setTimeout(r, 400)); }
+      try { a = { ok: true, v: await withTimeout(idbGet("state"), 4000) }; } catch (e) { dbPromise = null; await new Promise((r) => setTimeout(r, 300)); }
     }
     let b = null;
     try { const raw = localStorage.getItem("mth_state_v1"); if (raw) b = JSON.parse(raw); } catch (e) { /* ignore */ }
     const ta = a.ok && a.v && typeof a.v === "object" ? (a.v.savedAt || 1) : 0;
     const tb = b && typeof b === "object" ? (b.savedAt || 1) : 0;
     const saved = ta || tb ? (ta >= tb ? a.v : b) : null;
-    if (!a.ok) idbSkip = true; // IndexedDB തകരാറിലാണെങ്കിൽ localStorage മാത്രം ഉപയോഗിക്കും
+    if (!a.ok) idbSkip = true;
     if (saved && typeof saved === "object" && saved.data) {
       state = Object.assign(base, saved);
       COLS.forEach((c) => { if (!state.data[c] || typeof state.data[c] !== "object") state.data[c] = base.data[c]; });
@@ -170,13 +168,13 @@
       if (!state.lock) state.lock = { n: 0, until: 0 };
     }
   }
-  function persist() { clearTimeout(persistTimer); persistTimer = setTimeout(persistNow, 250); }
+  function persist() { persistNow(); }
   async function persistNow() {
     clearTimeout(persistTimer);
     state.savedAt = Date.now();
     try { localStorage.setItem("mth_state_v1", JSON.stringify(state)); } catch (e) { /* full */ }
     if (idbSkip) return;
-    try { await withTimeout(idbSet("state", JSON.parse(JSON.stringify(state))), 4000); } catch (e) { dbPromise = null; /* localStorage copy remains */ }
+    try { await withTimeout(idbSet("state", JSON.parse(JSON.stringify(state))), 4000); } catch (e) { dbPromise = null; }
   }
 
   /* =====================================================================
@@ -195,20 +193,18 @@
     rec.updatedAt = Date.now();
     state.data[col][rec.id] = rec;
     state.dirty[col + "/" + rec.id] = 1;
-    persist();
+    persistNow();
     scheduleSync();
     return rec;
   }
   function softDelete(col, id) { const r = state.data[col][id]; if (r) { r.deleted = true; save(col, r); } }
 
-  // Money owed TO suppliers
   function supplierSummary(id) {
     const s = state.data.suppliers[id];
     let billed = s ? num(s.openingPayable) : 0, paid = 0;
     live("purchases").forEach((p) => { if (p.supplierId === id) { billed += num(p.total); paid += num(p.paid); } });
     return { billed: r2(billed), paid: r2(paid), balance: r2(billed - paid) };
   }
-  // Money owed BY shops
   function shopSummary(id) {
     const s = state.data.shops[id];
     let billed = s ? num(s.openingCredit) : 0, paid = 0;
@@ -242,20 +238,26 @@
   function applyTheme() { document.documentElement.setAttribute("data-theme", state.theme === "dark" ? "dark" : "light"); }
 
   /* =====================================================================
-     5. FIREBASE SYNC
+     5. FIREBASE SYNC (ENHANCED ERROR REPORTING & INSTANT PUSH)
      ===================================================================== */
   let syncing = false, syncTimer = null, syncState = "idle", syncErr = "";
   const online = () => navigator.onLine !== false;
   const pending = () => Object.keys(state.dirty).length;
   const url = (path) => dbBase().replace(/\/+$/, "") + "/" + CFG.ROOT + (path ? "/" + path : "") + ".json";
 
+  function friendlyHttpError(status) {
+    if (status === 401 || status === 403) return "Firebase Rules പെർമിഷൻ ഇല്ല (401) — Rules-ൽ read/write true ആക്കുക";
+    if (status === 404) return "Firebase URL തെറ്റാണ് (404) — ശരിയായ Database URL നൽകുക";
+    return "HTTP " + status;
+  }
+
   async function fetchRoot() {
     const r = await fetch(url(""), { cache: "no-store" });
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!r.ok) throw new Error(friendlyHttpError(r.status));
     return r.json();
   }
   function mergeRemote(root) {
-    if (!root) return false;
+    if (!root || typeof root !== "object") return false;
     let changed = false;
     COLS.forEach((col) => {
       const rc = root[col];
@@ -282,7 +284,7 @@
         if (!rec) { delete state.dirty[k]; return; }
         const stamp = rec.updatedAt;
         const r = await fetch(url(k), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(rec) });
-        if (!r.ok) throw new Error("HTTP " + r.status);
+        if (!r.ok) throw new Error(friendlyHttpError(r.status));
         const now = state.data[col][id];
         if (now && now.updatedAt === stamp) delete state.dirty[k];
       }));
@@ -302,7 +304,7 @@
       if (changed) { try { await push(); } catch (e) { /* retry next time */ } }
     } else { syncState = "err"; }
     syncing = false;
-    persist(); updateStatus();
+    persistNow(); updateStatus();
     if (changed) softRefresh();
     return syncState;
   }
@@ -311,9 +313,9 @@
     const n = pending();
     if (!online()) return ["off", "ഓഫ്‌ലൈൻ" + (n ? " • " + n + " മാറ്റം അയക്കാനുണ്ട്" : " • ഫോണിൽ സേവ് ആകുന്നു")];
     if (syncState === "busy") return ["busy", "സിങ്ക് ചെയ്യുന്നു…"];
-    if (syncState === "err") return ["err", "സെർവർ ലഭ്യമല്ല (" + syncErr + ")" + (n ? " • " + n + " മാറ്റം പിന്നീട് അയക്കും" : "")];
+    if (syncState === "err") return ["err", "സെർവർ പിഴവ്: " + syncErr + (n ? " • " + n + " മാറ്റം ബാക്കി" : "")];
     if (n) return ["", "ഓൺലൈൻ • " + n + " മാറ്റം അയക്കാനുണ്ട്"];
-    return ["", "ഓൺലൈൻ • സിങ്ക് പൂർത്തിയായി"];
+    return ["", "ഓൺലൈൻ • 3 ഫോണുകളിലും സിങ്ക് പൂർത്തിയായി"];
   }
   function updateStatus() {
     const d = $("#syncDot"), t = $("#syncText");
@@ -334,7 +336,7 @@
     el.className = "toast" + (kind ? " " + kind : "");
     el.hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { el.hidden = true; }, 3400);
+    toastTimer = setTimeout(() => { el.hidden = true; }, 3800);
   }
   let modal = null;
   function openModal(m) {
@@ -366,7 +368,8 @@
     return '<div class="login"><div class="login-card"><div class="login-head"><div class="logo">MTP</div><h1>' + h(b.name) + '</h1><div class="tag">' + h(b.tag) + "</div>" + (b.place || b.phone ? '<div class="loc">' + (b.place ? "📍 " + h(b.place) : "") + (b.phone ? " • 📞 " + h(b.phone) : "") + "</div>" : "") + "</div>" +
       '<div class="login-body"><h2>സുരക്ഷാ പിൻ നൽകുക</h2><p>അഡ്മിൻ അല്ലെങ്കിൽ സ്റ്റാഫ് പിൻ ടൈപ്പ് ചെയ്യുക</p><div class="dots" id="dots">' + dots + '</div><div class="pin-err" id="pinErr"></div>' +
       '<div class="pad">' + keys + '<button type="button" class="sec" data-act="pin-clear">CLEAR</button><button type="button" data-act="pin" data-k="0">0</button><button type="button" class="sec2" data-act="pin-back" aria-label="Backspace">' + ICON.delete + "</button></div>" +
-      '<div class="sync-note"><span class="dot ' + statusText()[0] + '" id="syncDot"></span><span id="syncText">' + h(statusText()[1]) + '</span></div><button type="button" class="linkbtn" data-act="db-url">Firebase വിലാസം</button></div></div></div>';
+      '<div class="sync-note"><span class="dot ' + statusText()[0] + '" id="syncDot"></span><span id="syncText">' + h(statusText()[1]) + '</span></div>' +
+      '<div class="row" style="justify-content:center;gap:12px;margin-top:6px"><button type="button" class="linkbtn" data-act="db-url">Firebase വിലാസം</button><button type="button" class="linkbtn" data-act="test-conn">സെർവർ ടെസ്റ്റ്</button></div></div></div></div>';
   }
   function updateDots() { const d = $("#dots"); if (d) d.innerHTML = [0, 1, 2, 3].map((i) => '<i class="' + (i < pin.length ? "on" : "") + '"></i>').join(""); }
   function pinMsg(msg) { const e = $("#pinErr"); if (e) e.textContent = msg || ""; }
@@ -374,13 +377,13 @@
   async function verifyPin() {
     const entered = pin, now = Date.now();
     if (state.lock.until > now) { pin = ""; updateDots(); pinMsg("കുറച്ച് സമയത്തിന് ശേഷം ശ്രമിക്കുക (" + Math.ceil((state.lock.until - now) / 1000) + " സെക്കൻഡ്)"); return; }
-    if (!state.lastSync && online()) { pinMsg("പരിശോധിക്കുന്നു…"); try { await withTimeout(sync(true), 8000); } catch (e) { /* use local */ } pinMsg(""); }
+    if (!state.lastSync && online()) { pinMsg("സെർവറുമായി ബന്ധപ്പെടുന്നു…"); try { await withTimeout(sync(true), 8000); } catch (e) { /* use local */ } pinMsg(""); }
     const hs = pinHash(entered);
     let sess = null;
     if (hs === S().adminHash) sess = { role: "admin", name: "അഡ്മിൻ", canProfit: true };
     else { const st = live("staff").find((x) => x.pinHash === hs); if (st) sess = { role: "staff", name: st.name, code: st.id, canProfit: !!st.canProfit }; }
     if (sess) {
-      state.lock = { n: 0, until: 0 }; persist();
+      state.lock = { n: 0, until: 0 }; persistNow();
       pin = ""; session = sess; ui.mode = "purchase"; ui.pane = "entry";
       autoBackupCheck(); render(); toast("സ്വാഗതം " + sess.name); sync(false);
       return;
@@ -388,7 +391,7 @@
     state.lock.n++;
     if (state.lock.n >= CFG.MAX_TRIES) { state.lock = { n: 0, until: Date.now() + CFG.LOCK_MS }; pinMsg("5 തവണ തെറ്റി. 30 സെക്കൻഡ് കാത്തിരിക്കുക."); }
     else pinMsg("തെറ്റായ പിൻ! (" + (CFG.MAX_TRIES - state.lock.n) + " ശ്രമങ്ങൾ ബാക്കി)");
-    persist(); pin = ""; updateDots();
+    persistNow(); pin = ""; updateDots();
     const d = $("#dots"); if (d) { d.classList.remove("shake"); void d.offsetWidth; d.classList.add("shake"); }
   }
   function logout() { session = null; pin = ""; modal = null; renderModal(); render(); }
@@ -399,8 +402,7 @@
   const isStandalone = () => window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
   const paneList = () => {
     const pm = ui.mode === "purchase";
-    const l = [["entry", pm ? "പർച്ചേസ്" : "സെയിൽസ്", pm ? "cart" : "receipt"], ["parties", pm ? "സപ്ലയർമാർ" : "കടകൾ", pm ? "truck" : "store"], ["reports", "റിപ്പോർട്ട്", "chart"], ["admin", isAdmin() ? "അഡ്മിൻ" : "ബാക്കപ്പ്", "shield"]];
-    return l;
+    return [["entry", pm ? "പർച്ചേസ്" : "സെയിൽസ്", pm ? "cart" : "receipt"], ["parties", pm ? "സപ്ലയർമാർ" : "കടകൾ", pm ? "truck" : "store"], ["reports", "റിപ്പോർട്ട്", "chart"], ["admin", isAdmin() ? "അഡ്മിൻ" : "ബാക്കപ്പ്", "shield"]];
   };
   function render() {
     const root = $("#root");
@@ -410,7 +412,7 @@
     if (!panes.some((p) => p[0] === ui.pane)) ui.pane = "entry";
     root.innerHTML =
       '<div class="app ' + (pm ? "m-p" : "m-s") + '"><header class="header"><div class="header-in"><div class="brand"><div class="logo">MTP</div><div style="min-width:0"><b>' + h(b.name) + '<span class="role ' + (isAdmin() ? "" : "staff") + '">' + (isAdmin() ? "ADMIN" : "STAFF") + "</span></b><small>" + h(session.name) + (b.place ? " • " + h(b.place) : "") + "</small></div></div>" +
-      '<div class="hbtns"><button type="button" class="hb" data-act="theme" aria-label="Theme">' + (state.theme === "dark" ? ICON.sun : ICON.moon) + '</button><button type="button" class="hb" data-act="install" id="btnInstall">' + ICON.phone2 + '</button><button type="button" class="hb red" data-act="logout">' + ICON.lock + "<span>ലോക്ക്</span></button></div></div>" +
+      '<div class="hbtns"><button type="button" class="hb" data-act="sync-now" aria-label="Sync">' + ICON.refresh + '</button><button type="button" class="hb" data-act="theme" aria-label="Theme">' + (state.theme === "dark" ? ICON.sun : ICON.moon) + '</button><button type="button" class="hb" data-act="install" id="btnInstall">' + ICON.phone2 + '</button><button type="button" class="hb red" data-act="logout">' + ICON.lock + "<span>ലോക്ക്</span></button></div></div>" +
       '<div class="statusbar"><span class="dot ' + st[0] + '" id="syncDot"></span><span id="syncText">' + h(st[1]) + "</span></div>" +
       '</header>' + modesHtml() +
       '<main class="main" id="app">' + paneHtml() + '</main><nav class="dock">' + panes.map((p) => '<button type="button" data-act="pane" data-p="' + p[0] + '" class="' + (ui.pane === p[0] ? "on" : "") + '">' + ICON[p[2]] + "<span>" + p[1] + "</span></button>").join("") + "</nav></div>";
@@ -478,7 +480,7 @@
     if (src !== "p_total") { const t = $("#p_total"); if (q > 0 && r > 0) t.value = r2(q * r); }
     else if (q > 0) { $("#p_rate").value = r2(num($("#p_total").value) / q); }
   }
-  function purchaseSupInfo() { const s = byId("suppliers", $("#p_sup") && $("#p_sup").value), el = $("#p_supinfo"); if (el) el.textContent = s ? (s.phone ? "📞 " + s.phone + "  " : "") + (s.place ? "📍 " + s.place + "  " : "") + "• കൊടുക്കാനുള്ളത്: " + money(supplierSummary(s.id).balance) : ""; }
+  function purchaseSupInfo() { const s = byId("suppliers", $("#p_sup") && $("#p_sup").value), el = $("#p_supinfo"); if (el) el.textContent = s ? (s.phone ? "📞 " + s.phone + " " : "") + (s.place ? "📍 " + s.place + " " : "") + "• കൊടുക്കാനുള്ളത്: " + money(supplierSummary(s.id).balance) : ""; }
 
   /* ---------- SALES entry ---------- */
   function rowHtml(it) {
@@ -511,7 +513,7 @@
     const raw = $("#s_paid") ? $("#s_paid").value : ""; const paid = raw === "" ? t : num(raw);
     const c = $("#s_credit"); if (c) c.textContent = money(Math.max(0, r2(t - paid)));
   }
-  function salesShopInfo() { const s = byId("shops", $("#s_shop") && $("#s_shop").value), el = $("#s_shopinfo"); if (el) el.textContent = s ? (s.phone ? "📞 " + s.phone + "  " : "") + (s.place ? "📍 " + s.place + "  " : "") + "• ബാക്കി കടം: " + money(shopSummary(s.id).balance) : ""; }
+  function salesShopInfo() { const s = byId("shops", $("#s_shop") && $("#s_shop").value), el = $("#s_shopinfo"); if (el) el.textContent = s ? (s.phone ? "📞 " + s.phone + " " : "") + (s.place ? "📍 " + s.place + " " : "") + "• ബാക്കി കടം: " + money(shopSummary(s.id).balance) : ""; }
   function salesListInner() {
     const q = norm(ui.sSearch);
     const arr = live("sales").filter((s) => (s.date || "").startsWith(ui.sMonth) && (!q || norm(s.shopName + " " + (s.billNo || "")).includes(q))).sort((a, b) => (b.date + (b.billNo || "")).localeCompare(a.date + (a.billNo || "")) || b.updatedAt - a.updatedAt);
@@ -568,13 +570,13 @@
         '<section class="card"><div class="row between pad-s"><div><h2>ഉൽപ്പന്നങ്ങളും വിലയും</h2><div class="muted">വിതരണ ബില്ലിൽ ഉപയോഗിക്കുന്നവ</div></div><button type="button" class="btn" data-act="add-product">' + ICON.plus + 'പുതിയ</button></div><div class="list">' + (sortedProducts().length ? sortedProducts().map((p) => '<div class="li"><div class="grow"><div class="t">' + h(p.name) + '</div><div class="s">' + h(p.unit) + '</div></div><div class="amt">' + money(p.price) + '</div><button type="button" class="btn sm ghost" data-act="edit-product" data-id="' + h(p.id) + '">' + ICON.edit + '</button><button type="button" class="btn sm ghost red" data-act="del-product" data-id="' + h(p.id) + '">' + ICON.trash + "</button></div>").join("") : emptyBox("ഉൽപ്പന്നങ്ങൾ ഇല്ല")) + "</div></section>" +
         '<section class="card"><div class="row between pad-s"><div><h2>സ്റ്റാഫ്</h2><div class="muted">ഓരോരുത്തർക്കും സ്വന്തം 4 അക്ക പിൻ</div></div><button type="button" class="btn" data-act="add-staff">' + ICON.plus + 'പുതിയ</button></div><div class="list">' + (live("staff").length ? live("staff").sort(byName).map((p) => '<div class="li"><div class="av">' + h(initial(p.name)) + '</div><div class="grow"><div class="t">' + h(p.name) + '</div><div class="s">' + (p.canProfit ? "ലാഭം കാണാം" : "ലാഭം മറച്ചത്") + '</div></div><button type="button" class="btn sm ghost" data-act="edit-staff" data-id="' + h(p.id) + '">' + ICON.edit + '</button><button type="button" class="btn sm ghost red" data-act="del-staff" data-id="' + h(p.id) + '">' + ICON.trash + "</button></div>").join("") : emptyBox("സ്റ്റാഫ് ഇല്ല")) + "</div></section>";
     }
-    o += '<section class="card stack"><h2>ബാക്കപ്പ് & സിങ്ക്</h2><div class="banner green" id="syncBanner">' + h(statusText()[1]) + (state.lastSync ? " • അവസാന സിങ്ക്: " + new Date(state.lastSync).toLocaleString("en-IN") : "") + '</div><div class="muted">ഡാറ്റ ബേസ്: ' + h(dbBase()) + '</div><div class="row wrap"><button type="button" class="btn" data-act="sync-now">' + ICON.refresh + 'സിങ്ക്</button><button type="button" class="btn ghost" data-act="snapshot">ഫോൺ ബാക്കപ്പ്</button><button type="button" class="btn ghost" data-act="export">' + ICON.download + 'JSON</button>' +
+    o += '<section class="card stack"><h2>ബാക്കപ്പ് & സിങ്ക്</h2><div class="banner ' + (syncState === "err" ? "red" : "green") + '" id="syncBanner">' + h(statusText()[1]) + (state.lastSync ? " • അവസാന സിങ്ക്: " + new Date(state.lastSync).toLocaleString("en-IN") : "") + '</div><div class="muted">ഡാറ്റ ബേസ്: ' + h(dbBase()) + '</div><div class="row wrap"><button type="button" class="btn" data-act="sync-now">' + ICON.refresh + 'സിങ്ക്</button><button type="button" class="btn ghost" data-act="snapshot">ഫോൺ ബാക്കപ്പ്</button><button type="button" class="btn ghost" data-act="export">' + ICON.download + 'JSON</button>' +
       (isAdmin() ? '<label class="btn ghost" style="cursor:pointer">' + ICON.upload + 'റീസ്റ്റോർ<input type="file" accept=".json,application/json" data-ch="restore-file" hidden></label><button type="button" class="btn ghost" data-act="db-url">Firebase വിലാസം</button>' : "") + '</div><div id="snapList" class="stack"><div class="muted">ലോഡ് ചെയ്യുന്നു…</div></div></section>';
     getSnapshots().then((arr) => { snapCache = arr; const el = $("#snapList"); if (el) el.innerHTML = arr.length ? arr.map((b) => '<div class="li" style="border:1px solid var(--line);border-radius:13px"><div class="grow"><div class="t">' + h(b.label) + '</div><div class="s">' + h(b.ts) + "</div></div>" + (isAdmin() ? '<button type="button" class="btn sm ghost" data-act="restore-snap" data-id="' + h(b.id) + '">Restore</button>' : "") + "</div>").join("") : '<div class="muted">ഫോൺ ബാക്കപ്പുകൾ ഇല്ല</div>'; });
     return o;
   }
 
-  /* --- canvas → JPEG → minimal PDF (works offline; browser shapes Malayalam correctly) --- */
+  /* --- canvas → JPEG → minimal PDF --- */
   const PW = 1240, PH = 1754, MX = 80, TOP = 200, BOT = 110;
   const FONT = '"Noto Sans Malayalam","Noto Sans","Manjari","Meera","Nirmala UI","Kartika",system-ui,sans-serif';
   const fit = (ctx, str, maxW) => { if (ctx.measureText(str).width <= maxW) return str; const g = segs(str); while (g.length > 1 && ctx.measureText(g.join("") + "…").width > maxW) g.pop(); return g.join("") + "…"; };
@@ -590,7 +592,7 @@
       x.fillStyle = "#fbbf24"; x.fillRect(0, 170, PW, 8);
       this.c = c; this.x = x; this.pages.push(c);
       const b = S().biz;
-      this.t(b.name + "  •  " + b.place + "  •  " + b.phone, MX, 40, { size: 22, weight: 600, color: "#bfdbfe", maxW: PW - 2 * MX });
+      this.t(b.name + " • " + b.place + " • " + b.phone, MX, 40, { size: 22, weight: 600, color: "#bfdbfe", maxW: PW - 2 * MX });
       this.t(this.title, MX, 92, { size: 44, weight: 800, color: "#fff", maxW: PW - 2 * MX });
       this.t(this.subtitle, MX, 140, { size: 27, weight: 600, color: "#dbeafe", maxW: PW - 2 * MX });
       this.y = TOP;
@@ -677,7 +679,7 @@
   }
   async function buildBillPdf(inv) {
     await ensureFonts();
-    const doc = new PdfDoc("ബിൽ " + inv.billNo, inv.shopName + "  •  " + fmtDate(inv.date) + (inv.shopPhone ? "  •  Ph: " + inv.shopPhone : ""));
+    const doc = new PdfDoc("ബിൽ " + inv.billNo, inv.shopName + " • " + fmtDate(inv.date) + (inv.shopPhone ? " • Ph: " + inv.shopPhone : ""));
     doc.table([{ label: "ഉൽപ്പന്നം", w: 0.42 }, { label: "അളവ്", w: 0.14, align: "center" }, { label: "നിരക്ക്", w: 0.18, align: "right" }, { label: "തുക", w: 0.26, align: "right", bold: true, color: "#047857" }],
       (inv.items || []).map((i) => ({ cells: [i.name, kgFmt(i.qty) + " " + i.unit, num(i.rate).toFixed(2), num(i.amount).toFixed(2)] })));
     doc.kv("ആകെ ബിൽ", money(inv.total), { bold: true, size: 34, line: true, gap: 66 });
@@ -782,7 +784,7 @@
     const b = S().biz, cr = r2(inv.total - inv.paid);
     return '<div class="inv"><div class="inv-h"><b>' + h(b.name) + "</b><div>" + h(b.tag) + "</div>" + (b.place || b.phone ? "<div>" + h(b.place) + (b.phone ? " | Ph: " + h(b.phone) : "") + "</div>" : "") + '</div><div class="inv-meta"><div><b>' + h(inv.shopName) + '</b><div class="muted">' + h(inv.shopPhone || "") + '</div></div><div class="right"><b class="mono">' + h(inv.billNo) + '</b><div class="muted">' + h(fmtDate(inv.date)) + "</div></div></div>" +
       '<table><thead><tr><th>ഉൽപ്പന്നം</th><th class="c">അളവ്</th><th class="r">നിരക്ക്</th><th class="r">തുക</th></tr></thead><tbody>' + (inv.items || []).map((i) => "<tr><td><b>" + h(i.name) + '</b></td><td class="c">' + kgFmt(i.qty) + " " + h(i.unit) + '</td><td class="r">' + kgFmt(i.rate) + '</td><td class="r"><b>' + num(i.amount).toFixed(2) + "</b></td></tr>").join("") + "</tbody></table>" +
-      '<div class="inv-t"><div class="big"><span>ആകെ ബിൽ</span><span>' + money(inv.total) + "</span></div><div><span>ലഭിച്ചത്</span><span>" + money(inv.paid) + '</span></div><div><span>ഈ ബില്ലിലെ കടം</span><b class="' + (cr > 0 ? "neg" : "") + '">' + money(cr) + "</b></div><div><span>കടയുടെ ആകെ ബാക്കി</span><b>" + money(shopSummary(inv.shopId).balance) + '</b></div></div><div class="inv-foot">നന്ദി! 🙏</div></div>';
+      '<div class="inv-t"><div class="big"><span>ആകെ ബിൽ</span><span>' + money(inv.total) + "</span></div><div><span>ലഭിച്ചത്</span><span>' + money(inv.paid) + '</span></div><div><span>ഈ ബില്ലിലെ കടം</span><b class="' + (cr > 0 ? "neg" : "") + '">' + money(cr) + "</b></div><div><span>കടയുടെ ആകെ ബാക്കി</span><b>" + money(shopSummary(inv.shopId).balance) + '</b></div></div><div class="inv-foot">നന്ദി! 🙏</div></div>';
   }
   function showBill(id) {
     const inv = byId("sales", id); if (!inv) return;
@@ -808,7 +810,7 @@
     arr.unshift({ id: "bk" + Date.now(), label, ts: new Date().toLocaleString("en-IN"), data: dataSnapshot() });
     try { await idbSet("snapshots", arr.slice(0, 15)); } catch (e) { /* ignore */ }
   }
-  async function autoBackupCheck() { const t = todayIso(); if (state.lastAutoBackup !== t) { state.lastAutoBackup = t; persist(); await createSnapshot("Auto Backup (" + t + ")"); } }
+  async function autoBackupCheck() { const t = todayIso(); if (state.lastAutoBackup !== t) { state.lastAutoBackup = t; persistNow(); await createSnapshot("Auto Backup (" + t + ")"); } }
   function restoreData(data) {
     const now = Date.now();
     BACKUP_COLS.forEach((col) => {
@@ -817,7 +819,7 @@
       Object.keys(state.data[col]).forEach((id) => { if (!map[id] && !state.data[col][id].deleted) { state.data[col][id].deleted = true; state.data[col][id].updatedAt = now; state.dirty[col + "/" + id] = 1; } });
       Object.keys(map).forEach((id) => { state.data[col][id] = Object.assign({}, map[id], { id, deleted: !!map[id].deleted, updatedAt: now }); state.dirty[col + "/" + id] = 1; });
     });
-    persist(); scheduleSync();
+    persistNow(); scheduleSync();
   }
   function download(blob, name) {
     const u = URL.createObjectURL(blob), a = document.createElement("a");
@@ -829,11 +831,16 @@
     "pin-back"() { pin = pin.slice(0, -1); updateDots(); },
     "pin-clear"() { pin = ""; updateDots(); pinMsg(""); },
     logout,
-    theme() { state.theme = state.theme === "dark" ? "light" : "dark"; applyTheme(); persist(); render(); },
+    theme() { state.theme = state.theme === "dark" ? "light" : "dark"; applyTheme(); persistNow(); render(); },
     install: async function () { if (installPrompt) { installPrompt.prompt(); try { await installPrompt.userChoice; } catch (e) { /* ignore */ } installPrompt = null; } else toast("ബ്രൗസർ മെനുവിലെ 'Install app' / 'Add to Home Screen' ഉപയോഗിക്കുക."); },
     mode(el) { ui.mode = el.dataset.m; ui.pane = "entry"; ui.editPurchase = null; ui.editSale = null; render(); },
     pane(el) { ui.pane = el.dataset.p; render(); window.scrollTo(0, 0); },
     "db-url": dbModal,
+    async "test-conn"() {
+      pinMsg("സെർവർ പരിശോധിക്കുന്നു…");
+      const r = await sync(true);
+      pinMsg(r === "ok" ? "✅ സെർവർ കണക്ട് ആയി!" : r === "offline" ? "ഓഫ്‌ലൈൻ ആണ്" : "❌ " + syncErr);
+    },
 
     "add-supplier"() { partyModal("supplier"); },
     "edit-supplier"(el) { const r = byId("suppliers", el.dataset.id); if (r) partyModal("supplier", r); },
@@ -924,7 +931,7 @@
     "edit-staff"(el) { const r = byId("staff", el.dataset.id); if (r) staffModal(r); },
     "del-staff"(el) { const r = byId("staff", el.dataset.id); if (r && isAdmin()) delConfirm("സ്റ്റാഫിനെ നീക്കം ചെയ്യണോ?", r.name, () => softDelete("staff", r.id)); },
     "sw-profit"(el) { el.classList.toggle("on"); },
-    async "sync-now"(el) { el.disabled = true; const r = await sync(true); el.disabled = false; toast(r === "ok" ? "സിങ്ക് പൂർത്തിയായി" : r === "offline" ? "ഓഫ്‌ലൈൻ ആണ്" : "സിങ്ക് പരാജയപ്പെട്ടു: " + syncErr, r === "ok" ? "" : "error"); if (ui.pane === "admin") render(); },
+    async "sync-now"(el) { el.disabled = true; const r = await sync(true); el.disabled = false; toast(r === "ok" ? "✅ സിങ്ക് പൂർത്തിയായി" : r === "offline" ? "ഓഫ്‌ലൈൻ ആണ്" : "❌ " + syncErr, r === "ok" ? "" : "error"); if (ui.pane === "admin") render(); },
     async snapshot() { await createSnapshot("Manual Backup (" + todayIso() + ")"); toast("✅ ഫോണിൽ ബാക്കപ്പ് എടുത്തു"); render(); },
     export() { download(new Blob([JSON.stringify({ app: "mtp-honey", v: 1, exportedAt: new Date().toISOString(), data: dataSnapshot() }, null, 2)], { type: "application/json" }), "MTP_Honey_Backup_" + todayIso() + ".json"); toast("📥 ഡൗൺലോഡ് ചെയ്തു"); },
     "restore-snap"(el) { if (!isAdmin()) return; const b = snapCache.find((x) => x.id === el.dataset.id); if (!b) return; confirmBox("റീസ്റ്റോർ ചെയ്യണോ?", b.label + " — നിലവിലെ ഡാറ്റ മാറ്റപ്പെടും.", "റീസ്റ്റോർ", () => { restoreData(b.data); toast("✅ റീസ്റ്റോർ ചെയ്തു"); render(); }); },
